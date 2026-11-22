@@ -12,6 +12,8 @@ services:
     build: .
     image: udp-line-measure
     command: ["python", "-m", "echo.server"]
+    ports:
+      - "9001:9001/udp"   # 便于宿主机直接发包做窗口对账
     environment:
       LINE_NAME: a
       UDP_PORT: "9001"
@@ -23,6 +25,8 @@ services:
     build: .
     image: udp-line-measure
     command: ["python", "-m", "echo.server"]
+    ports:
+      - "9002:9002/udp"
     environment:
       LINE_NAME: b
       UDP_PORT: "9002"

@@ -1,4 +1,4 @@
-"""FastAPI 入口：测量、建议查询、切线、线路模拟参数代理。
+"""FastAPI 入口：测量、建议查询、切线、线路模拟参数与窗口对账代理。
 
 - ``POST /api/measure``            发起一轮测量（后台执行，202 返回任务）
 - ``GET  /api/measurements/{id}``  查询测量进度与逐包事件
@@ -6,6 +6,10 @@
 - ``POST /api/line/switch``        切线：立即撤下旧建议并推进 epoch
 - ``GET  /api/lines``              两条回显线路的实时配置与统计
 - ``POST /api/lines/{name}/config`` 调整线路模拟参数（超长丢包/延迟/断线）
+- ``POST /api/lines/{name}/windows/open``   回显端开窗（每条线同时只开放一窗）
+- ``POST /api/lines/{name}/windows/close``  封窗（前一窗未结算完则 409 忙）
+- ``GET  /api/lines/{name}/windows``        查看开放窗/结算中窗/最近结算汇总
+- ``GET  /api/lines/{name}/windows/{id}``   按窗口查账
 - ``GET  /docs``                   Swagger 交互式演示
 """
 from __future__ import annotations
@@ -163,6 +167,15 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 线路控制口不可达也要能展示
             return {**base, "reachable": False, "error": str(exc)}
 
+    async def _line_endpoint(name: str) -> LineEndpoint:
+        ep = manager.lines.get(name)
+        if ep is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未知线路 {name!r}，可选: {sorted(manager.lines)}",
+            )
+        return ep
+
     @app.get("/api/lines", summary="两条线路的实时配置与统计")
     async def list_lines() -> list[dict]:
         return await asyncio.gather(
@@ -171,12 +184,7 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
 
     @app.post("/api/lines/{name}/config", summary="调整线路模拟参数")
     async def set_line_config(name: str, patch: LineConfigPatch) -> dict:
-        ep = manager.lines.get(name)
-        if ep is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"未知线路 {name!r}，可选: {sorted(manager.lines)}",
-            )
+        ep = await _line_endpoint(name)
         try:
             resp = await http.post(
                 f"{ep.ctrl_url}/config",
@@ -188,6 +196,46 @@ def create_app(lines: dict[str, LineEndpoint] | None = None) -> FastAPI:
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"线路控制口不可达: {exc}")
         return resp.json()
+
+    async def _window_call(name: str, method: str, path: str) -> dict:
+        """把窗口操作转发到回显端控制口，保留其 409（忙）/404 语义。"""
+        ep = await _line_endpoint(name)
+        try:
+            resp = await http.request(method, f"{ep.ctrl_url}{path}")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"线路控制口不可达: {exc}")
+        try:
+            body = resp.json()
+        except ValueError:
+            body = resp.text
+        if resp.status_code >= 400:
+            detail = body.get("detail") if isinstance(body, dict) else body
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        return body
+
+    @app.post(
+        "/api/lines/{name}/windows/open",
+        status_code=201,
+        summary="回显端开窗（每条线同时只开放一窗）",
+    )
+    async def open_window(name: str) -> dict:
+        return await _window_call(name, "POST", "/windows/open")
+
+    @app.post("/api/lines/{name}/windows/close", summary="回显端封窗")
+    async def close_window(name: str) -> dict:
+        return await _window_call(name, "POST", "/windows/close")
+
+    @app.get("/api/lines/{name}/windows", summary="窗口台账与最近结算汇总")
+    async def list_windows(name: str) -> dict:
+        return await _window_call(name, "GET", "/windows")
+
+    @app.get("/api/lines/{name}/windows/last", summary="最近一份结算汇总")
+    async def last_window(name: str) -> dict:
+        return await _window_call(name, "GET", "/windows/last")
+
+    @app.get("/api/lines/{name}/windows/{window_id}", summary="按窗口查账")
+    async def get_window(name: str, window_id: str) -> dict:
+        return await _window_call(name, "GET", f"/windows/{window_id}")
 
     return app
 

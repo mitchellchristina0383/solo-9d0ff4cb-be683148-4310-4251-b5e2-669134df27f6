@@ -2,7 +2,8 @@
 """端到端自测脚本（仅用标准库）：对运行中的服务栈做完整场景核对。
 
 覆盖：超长丢包二分测量、探测次数对数级、切线即撤建议、断线无法判定、
-测量中切线作废、切回原线路也只认切换后的测量、/docs 可用。
+测量中切线作废、切回原线路也只认切换后的测量、/docs 可用；
+窗口对账：开窗/封窗/查账、测量包入账、跨窗迟到回包、封窗报忙。
 
 用法：
     python3 scripts/e2e.py --base http://127.0.0.1:8000
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -68,8 +70,16 @@ def measure(base: str, lower: int, upper: int, timeout_ms: int = 300) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8000")
-    base = parser.parse_args().base.rstrip("/")
-    print(f"目标服务: {base}\n")
+    parser.add_argument(
+        "--line-a-udp",
+        default="127.0.0.1:9001",
+        help="线路 a 的 UDP 地址（脚本直接发裸包用）",
+    )
+    args = parser.parse_args()
+    base = args.base.rstrip("/")
+    udp_host, udp_port = args.line_a_udp.rsplit(":", 1)
+    line_a_udp = (udp_host, int(udp_port))
+    print(f"目标服务: {base}  线路 a UDP: {line_a_udp[0]}:{line_a_udp[1]}\n")
 
     print("== 0. 服务与文档可用 ==")
     status, _ = api(base, "GET", "/")
@@ -155,6 +165,101 @@ def main() -> int:
     check("线路 b 有断线丢包计数",
           by_name["b"]["reachable"] and by_name["b"]["stats"]["dropped_down"] > 0,
           f"dropped_down={by_name['b']['stats']['dropped_down']}")
+
+    print("== 8. 窗口对账：开窗→测量发包→查账→封窗 ==")
+    status, body = api(base, "POST", "/api/lines/a/windows/open")
+    check("开窗返回 201", status == 201, f"status={status}")
+    win = body["window"]
+    status, _ = api(base, "POST", "/api/lines/a/windows/open")
+    check("同一线重复开窗报 409", status == 409, f"status={status}")
+
+    rec = measure(base, 512, 9000)
+    status, body = api(base, "GET", f"/api/lines/a/windows/{win['id']}")
+    live = body["window"]
+    check("测量包已入账（收包>0）", live["received"] > 0,
+          f"received={live['received']}")
+    check("超长丢弃已入账", live["dropped_oversize"] > 0,
+          f"dropped_oversize={live['dropped_oversize']}")
+    status, body = api(base, "POST", "/api/lines/a/windows/close")
+    settled = body["window"]
+    check("封窗即结算", status == 200 and settled["status"] == "settled",
+          f"status={settled['status']}, pending={settled['pending_sends']}")
+    check("账目自洽（收包=超长+断线+已提交+发送失败）",
+          settled["received"] == settled["dropped_oversize"]
+          + settled["dropped_down"] + settled["committed_sends"]
+          + settled["send_failures"],
+          f"received={settled['received']}, committed={settled['committed_sends']}, "
+          f"oversize={settled['dropped_oversize']}")
+    status, body = api(base, "GET", "/api/lines/a/windows/last")
+    check("最近一份结算可取", status == 200 and body["window"]["id"] == win["id"])
+
+    # 封窗后发的包不再记入本轮账
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(b"after-close", line_a_udp)
+    sock.close()
+    time.sleep(0.1)
+    _, body = api(base, "GET", f"/api/lines/a/windows/{win['id']}")
+    check("封窗后新包不入旧账", body["window"]["received"] == settled["received"])
+
+    print("== 9. 跨窗迟到回包记回原窗；前一窗结算中封窗报忙 ==")
+    api(base, "POST", "/api/lines/a/config", {"delay_ms": 400})
+    status, body = api(base, "POST", "/api/lines/a/windows/open")
+    first = body["window"]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    sock.sendto(b"late-packet", line_a_udp)
+    time.sleep(0.1)  # 包已收下，回包仍在 400ms 延迟队列
+    _, body = api(base, "POST", "/api/lines/a/windows/close")
+    check("封窗后进入结算（待发=1）",
+          body["window"]["status"] == "settling"
+          and body["window"]["pending_sends"] == 1,
+          f"status={body['window']['status']}, "
+          f"pending={body['window']['pending_sends']}")
+
+    status, body = api(base, "POST", "/api/lines/a/windows/open")
+    second = body["window"]
+    check("前一窗结算中仍可开下一窗", status == 201
+          and second["id"] != first["id"])
+    sock.sendto(b"next-window", line_a_udp)
+    status, body = api(base, "POST", "/api/lines/a/windows/close")
+    check("前一窗结算中封下一窗报 409 忙", status == 409,
+          f"status={status}, detail={body.get('detail') if isinstance(body, dict) else body}")
+    _, body = api(base, "GET", f"/api/lines/a/windows/{second['id']}")
+    check("报忙后下一窗仍开放并继续计数",
+          body["window"]["status"] == "open" and body["window"]["received"] == 1,
+          f"status={body['window']['status']}, "
+          f"received={body['window']['received']}")
+
+    got = []
+    try:
+        while len(got) < 2:
+            got.append(sock.recv(2048))
+    except socket.timeout:
+        pass
+    sock.close()
+    check("迟到回包确实到达", len(got) == 2, f"收到 {len(got)} 个回包")
+    time.sleep(0.1)
+    _, body = api(base, "GET", f"/api/lines/a/windows/{first['id']}")
+    check("迟到回包记回原窗并结算",
+          body["window"]["status"] == "settled"
+          and body["window"]["committed_sends"] == 1
+          and body["window"]["pending_sends"] == 0,
+          f"status={body['window']['status']}, "
+          f"committed={body['window']['committed_sends']}")
+    _, body = api(base, "GET", f"/api/lines/a/windows/{second['id']}")
+    check("下一窗只记自己的回包，未串入原窗迟到包",
+          body["window"]["received"] == 1
+          and body["window"]["committed_sends"] == 1
+          and body["window"]["dropped_oversize"] == 0,
+          f"received={body['window']['received']}, "
+          f"committed={body['window']['committed_sends']}")
+    status, body = api(base, "POST", "/api/lines/a/windows/close")
+    check("原窗结算完后下一窗可正常封窗",
+          status == 200 and body["window"]["id"] == second["id"],
+          f"status={body['window']['status']}")
+    api(base, "POST", "/api/lines/a/config", {"delay_ms": 30})
+    status, _ = api(base, "GET", "/api/lines/nope/windows")
+    check("未知线路查账返回 404", status == 404)
 
     failed = [item for item in RESULTS if not item[0]]
     print(f"\n汇总: {len(RESULTS) - len(failed)}/{len(RESULTS)} 项通过")
